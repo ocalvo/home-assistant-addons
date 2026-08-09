@@ -11,43 +11,41 @@ import os
 import logging
 import gammu
 
+from gammu_worker import GammuWorkerProxy
+
 
 def init_state_machine(pin, device_path='/dev/ttyUSB0', baud_rate='auto'):
-    """Initialize gammu state machine with HA add-on config.
+    """Initialize the gammu worker with HA add-on config.
+
+    Returns a GammuWorkerProxy rather than a bare StateMachine. The proxy exposes the
+    StateMachine API by name and executes every call on a single thread that owns the
+    state machine, which is what makes concurrent use from Flask handlers, the MQTT
+    loops and the ReadDevice loop safe. Call sites are unchanged.
 
     baud_rate: 'auto' ponechá gammu auto-detekci rychlosti (connection = at),
     konkrétní hodnota (např. '115200') rychlost zafixuje (connection = at115200).
     Auto-detekce zasekává některé moduly (SIM800C) → default je fixní rychlost.
     """
-    sm = gammu.StateMachine()
-
     # Rychlost: 'auto' -> at (gammu hádá), jinak at<rychlost> (fixní)
     if baud_rate and str(baud_rate) != 'auto':
         connection = f"at{baud_rate}"
     else:
         connection = "at"
 
-    # Create gammu config dynamically
-    config_content = f"""[gammu]
-device = {device_path}
-connection = {connection}
-commtimeout = 40
-"""
+    # SetConfig replaces the gammurc file that used to be written to /tmp. Nothing is
+    # lost in the move: that file also set commtimeout = 40, which libGammu never
+    # reads. The option belongs to gammu-smsd (smsd/core.c) and has no effect here.
+    config = {"Device": device_path, "Connection": connection}
 
-    # Write config to temporary file
-    config_file = '/tmp/gammu.config'
-    with open(config_file, 'w') as f:
-        f.write(config_content)
+    machine = GammuWorkerProxy(config)
 
-    sm.ReadConfig(Filename=config_file)
-    
     try:
-        sm.Init()
+        machine.init()
         logging.info(f"Successfully initialized gammu with device: {device_path}")
 
         # Try to check security status
         try:
-            security_status = sm.GetSecurityStatus()
+            security_status = machine.GetSecurityStatus()
             logging.info(f"SIM security status: {security_status}")
 
             if security_status == 'PIN':
@@ -55,13 +53,14 @@ commtimeout = 40
                     logging.error("PIN is required but not provided.")
                     sys.exit(1)
                 else:
-                    sm.EnterSecurityCode('PIN', pin)
+                    machine.EnterSecurityCode('PIN', pin)
                     logging.info("PIN entered successfully")
 
         except Exception as e:
             logging.warning(f"Could not check SIM security status: {e}")
 
     except gammu.ERR_NOSIM:
+        # The worker thread survives a failed Init, so the proxy stays usable.
         logging.warning("SIM card not accessible, but device is connected")
     except Exception as e:
         logging.error(f"Error initializing device: {e}")
@@ -70,9 +69,11 @@ commtimeout = 40
             logging.info(f"Available devices: {', '.join([f'/dev/{d}' for d in sorted(devices)[:10]])}")
         except:
             pass
+        # Do not leak the worker thread and its event loop on a failed startup.
+        machine.terminate()
         raise
-        
-    return sm
+
+    return machine
 
 
 def retrieveAllSms(machine):
